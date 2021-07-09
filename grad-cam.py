@@ -2,7 +2,7 @@ from keras.applications.vgg16 import (
     VGG16, preprocess_input, decode_predictions)
 from keras.preprocessing import image
 from keras.layers.core import Lambda
-from keras.models import Sequential
+from keras.models import Model
 from tensorflow.python.framework import ops
 import keras.backend as K
 import tensorflow as tf
@@ -62,6 +62,11 @@ def modify_backprop(model, name):
         new_model = VGG16(weights='imagenet')
     return new_model
 
+def _compute_gradients(tensor, var_list):
+    grads = tf.gradients(tensor, var_list)
+    return [grad if grad is not None else tf.zeros_like(var)
+        for var, grad in zip(var_list, grads)]
+
 def deprocess_image(x):
     '''
     Same normalization as in:
@@ -86,18 +91,15 @@ def deprocess_image(x):
     return x
 
 def grad_cam(input_model, image, category_index, layer_name):
-    model = Sequential()
-    model.add(input_model)
-
     nb_classes = 1000
     target_layer = lambda x: target_category_loss(x, category_index, nb_classes)
-    model.add(Lambda(target_layer,
-                     output_shape = target_category_loss_output_shape))
-
-    loss = K.sum(model.layers[-1].output)
-    conv_output =  [l for l in model.layers[0].layers if l.name is layer_name][0].output
-    grads = normalize(K.gradients(loss, conv_output)[0])
-    gradient_function = K.function([model.layers[0].input], [conv_output, grads])
+    x = Lambda(target_layer, output_shape = target_category_loss_output_shape)(input_model.output)
+    model = Model(inputs=input_model.input, outputs=x)
+    model.summary()
+    loss = K.sum(model.output)
+    conv_output =  [l for l in model.layers if l.name is layer_name][0].output
+    grads = normalize(_compute_gradients(loss, [conv_output])[0])
+    gradient_function = K.function([model.input], [conv_output, grads])
 
     output, grads_val = gradient_function([image])
     output, grads_val = output[0, :], grads_val[0, :, :, :]
@@ -109,7 +111,10 @@ def grad_cam(input_model, image, category_index, layer_name):
         cam += w * output[:, :, i]
 
     cam = cv2.resize(cam, (224, 224))
-    cam = np.maximum(cam, 0)
+    
+    #shift values by min
+    cam -= np.min(cam)
+    # cam = np.maximum(cam, 0)
     heatmap = cam / np.max(cam)
 
     #Return to BGR [0..255] from the preprocessed image
@@ -117,21 +122,37 @@ def grad_cam(input_model, image, category_index, layer_name):
     image -= np.min(image)
     image = np.minimum(image, 255)
 
-    cam = cv2.applyColorMap(np.uint8(255*heatmap), cv2.COLORMAP_JET)
-    cam = np.float32(cam) + np.float32(image)
-    cam = 255 * cam / np.max(cam)
-    return np.uint8(cam), heatmap
+
+    _, cam = cv2.threshold(np.uint8(255*heatmap), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    cam = cam / np.max(cam)
+    cam = 1 - cam
+    edges = cv2.Canny(np.uint8(255*cam),0,255)
+    # cv2 channels formated as bgr
+    from copy import deepcopy
+    outlined_image = deepcopy(image)
+    outlined_image[:,:,2] += edges
+    outlined_image[outlined_image>255] = 255
+    
+    # masked_image = image*cam.reshape((224,224, 1))
+    # cam = cv2.applyColorMap(np.uint8(255*heatmap), cv2.COLORMAP_JET)
+    #cam = np.float32(cam) #+  np.float32(image)
+    #cam = cam / np.max(cam)
+
+    return np.uint8(outlined_image), heatmap
 
 preprocessed_input = load_image(sys.argv[1])
 
 model = VGG16(weights='imagenet')
 
 predictions = model.predict(preprocessed_input)
+print(predictions)
 top_1 = decode_predictions(predictions)[0][0]
+print(decode_predictions(predictions))
 print('Predicted class:')
 print('%s (%s) with probability %.2f' % (top_1[1], top_1[0], top_1[2]))
 
 predicted_class = np.argmax(predictions)
+print(f"predicted_class: {predicted_class}")
 cam, heatmap = grad_cam(model, preprocessed_input, predicted_class, "block5_conv3")
 cv2.imwrite("gradcam.jpg", cam)
 
